@@ -1,0 +1,142 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${0:A:h}"
+PLANNER="$ROOT/src/planner.py"
+BRIDGE="$ROOT/.build/EventKitBridge"
+BRIDGE_SRC="$ROOT/src/EventKitBridge.swift"
+PLIST_SRC="$ROOT/src/Info.plist"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./things-reminders doctor
+  ./things-reminders inspect [planner options]
+  ./things-reminders plan [planner options]
+  ./things-reminders preflight RUN_DIR
+  ./things-reminders apply RUN_DIR [--yes]
+  ./things-reminders verify RUN_DIR
+  ./things-reminders rollback-preview RUN_DIR
+  ./things-reminders rollback RUN_DIR [--yes]
+
+Safe defaults:
+  plan aborts on Things "after completion" and other unsupported recurrence patterns.
+  Recurring projects become one native recurring reminder with their child-task blueprint in notes.
+  Add --recurring-projects=manual to leave recurring projects for hand transfer instead.
+  Add --unsupported=manual to import everything supported and create MANUAL_REVIEW.md.
+  Add --after-completion=fixed only to intentionally convert those rules to fixed schedules.
+EOF
+}
+
+need_bridge() {
+  if [[ ! -x "$BRIDGE" || "$BRIDGE_SRC" -nt "$BRIDGE" || "$PLIST_SRC" -nt "$BRIDGE" ]]; then
+    "$ROOT/build.sh"
+  fi
+}
+
+run_id_for() {
+  /usr/bin/env python3 - "$1" <<'PY'
+import json, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+for name in ("manifest.json", "plan.json"):
+    path = run / name
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            print(json.load(f)["runID"])
+        break
+else:
+    raise SystemExit("Neither manifest.json nor plan.json exists")
+PY
+}
+
+planned_count_for() {
+  /usr/bin/env python3 - "$1/plan.json" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    print(len(json.load(f)['items']))
+PY
+}
+
+confirm_apply() {
+  local run="$1" yes="${2:-}"
+  [[ "$yes" == "--yes" ]] && return 0
+  local id count answer
+  id="$(run_id_for "$run")"
+  count="$(planned_count_for "$run")"
+  print "This will CREATE $count reminders in isolated lists prefixed with run ID $id."
+  print -n "Type the exact run ID to continue: "
+  read -r answer
+  [[ "$answer" == "$id" ]] || { print -u2 "Confirmation did not match; nothing changed."; exit 1; }
+}
+
+confirm_rollback() {
+  local run="$1" yes="${2:-}"
+  [[ "$yes" == "--yes" ]] && return 0
+  local id answer
+  id="$(run_id_for "$run")"
+  print "Rollback deletes exact EventKit reminder IDs recorded in manifest.json; empty migration-created lists are then removed."
+  print -n "Type ROLLBACK $id to continue: "
+  read -r answer
+  [[ "$answer" == "ROLLBACK $id" ]] || { print -u2 "Confirmation did not match; nothing changed."; exit 1; }
+}
+
+[[ $# -ge 1 ]] || { usage; exit 64; }
+command="$1"; shift
+case "$command" in
+  doctor)
+    print "macOS: $(sw_vers -productVersion 2>/dev/null || echo unavailable)"
+    print "Python: $(/usr/bin/env python3 --version 2>&1)"
+    if xcrun --find swiftc >/dev/null 2>&1; then print "Swift: $(xcrun swiftc --version | head -1)"; else print "Swift: MISSING"; fi
+    if [[ -x "$BRIDGE" ]]; then
+      print "Bridge: built"
+      codesign -dv "$BRIDGE" 2>&1 | grep -E 'Identifier=|TeamIdentifier=' || true
+    else
+      print "Bridge: not built yet"
+    fi
+    ;;
+  inspect)
+    exec /usr/bin/env python3 "$PLANNER" inspect "$@"
+    ;;
+  plan)
+    exec /usr/bin/env python3 "$PLANNER" plan "$@"
+    ;;
+  preflight)
+    [[ $# -eq 1 ]] || { usage; exit 64; }
+    need_bridge
+    exec "$BRIDGE" preflight "${1:A}"
+    ;;
+  apply)
+    [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
+    run="${1:A}"; yes="${2:-}"
+    [[ -f "$run/plan.json" ]] || { print -u2 "Missing plan.json in $run"; exit 1; }
+    need_bridge
+    mkdir -p "$run/logs"
+    "$BRIDGE" preflight "$run" 2>&1 | tee -a "$run/logs/preflight.log"
+    confirm_apply "$run" "$yes"
+    "$BRIDGE" apply "$run" 2>&1 | tee -a "$run/logs/apply.log"
+    "$BRIDGE" verify "$run" 2>&1 | tee -a "$run/logs/verify.log"
+    ;;
+  verify)
+    [[ $# -eq 1 ]] || { usage; exit 64; }
+    need_bridge
+    exec "$BRIDGE" verify "${1:A}"
+    ;;
+  rollback-preview)
+    [[ $# -eq 1 ]] || { usage; exit 64; }
+    run="${1:A}"
+    [[ -f "$run/manifest.json" ]] || { print -u2 "Missing manifest.json in $run; nothing can be previewed safely."; exit 1; }
+    need_bridge
+    exec "$BRIDGE" rollback-preview "$run"
+    ;;
+  rollback)
+    [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
+    run="${1:A}"; yes="${2:-}"
+    [[ -f "$run/manifest.json" ]] || { print -u2 "Missing manifest.json in $run; nothing can be rolled back safely."; exit 1; }
+    need_bridge
+    mkdir -p "$run/logs"
+    "$BRIDGE" rollback-preview "$run" 2>&1 | tee -a "$run/logs/rollback-preview.log"
+    confirm_rollback "$run" "$yes"
+    "$BRIDGE" rollback "$run" 2>&1 | tee -a "$run/logs/rollback.log"
+    ;;
+  *) usage; exit 64 ;;
+esac

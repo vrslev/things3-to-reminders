@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>dev.vrslev.things-reminders-migrator</string>
+  <key>CFBundleName</key>
+  <string>Things Reminders Migrator</string>
+  <key>CFBundleDisplayName</key>
+  <string>Things Reminders Migrator</string>
+  <key>CFBundleVersion</key>
+  <string>10</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.3.7</string>
+  <key>NSRemindersUsageDescription</key>
+  <string>Create and roll back reminders imported from a read-only Things 3 snapshot.</string>
+  <key>NSRemindersFullAccessUsageDescription</key>
+  <string>Create, verify, and roll back reminders imported from a read-only Things 3 snapshot.</string>
+</dict>
+</plist>
