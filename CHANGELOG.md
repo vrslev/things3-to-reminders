@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.0
+
+- Integrate the standalone verbatim `archive.py` pipeline and expose it through `things-reminders archive`; no second repository is required at runtime.
+- Add read-only snapshot staging, exact SQLite/FTS5 preservation (including leading/trailing title, note, and checklist whitespace), calibration review, snapshot-bound label import, and offline JSON/HTML knowledge-index generation.
+- Add `archive-plan` for a `things-verbatim-knowledge-index/v1` source.
+- Map archive records to isolated completed-reminder lists separated by Things Area, using `No Area` for unassigned records, with exact completion timestamps, visible native dates, and native Things URLs.
+- Match normal-import note style for archives: exact original notes plus concise Project, Heading, tags, and Markdown checklist context; keep archive categories, classification, status, IDs, dates, and provenance private.
+- Add deterministic pilot selection that includes human keeps and EventKit edge cases before a hash sample.
+- Preserve canceled-source status as searchable metadata while representing those records as completed so the archive stays hidden from ordinary Reminders lists.
+- Add optional `completed` and `completionDate` plan fields, EventKit writes, read-back verification, and preflight validation in plan schema v5.
+- Add `validate-plan` to decode and fully validate a run without requesting Reminders access.
+- Add explicit `main_migration` and `verbatim_archive` plan kinds while keeping one shared apply/verify/rollback lifecycle.
+- Persist `planKind` in plans and manifests and fail closed on a manifest/plan kind mismatch.
+- Add `run-kind` for read-only lifecycle inspection; applied-run manifests take precedence over mutable plan files.
+- Retain backward compatibility with plan schemas v1–v4 and active-task plans.
+
 ## 0.3.7
 
 - Fix `BYSETPOS` candidate-range rules expanding into every listed date in Apple Reminders.

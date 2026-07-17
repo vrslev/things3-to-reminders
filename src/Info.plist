@@ -9,9 +9,9 @@
   <key>CFBundleDisplayName</key>
   <string>Things Reminders Migrator</string>
   <key>CFBundleVersion</key>
-  <string>10</string>
+  <string>11</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.3.7</string>
+  <string>0.4.0</string>
   <key>NSRemindersUsageDescription</key>
   <string>Create and roll back reminders imported from a read-only Things 3 snapshot.</string>
   <key>NSRemindersFullAccessUsageDescription</key>

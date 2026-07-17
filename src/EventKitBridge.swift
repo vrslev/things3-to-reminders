@@ -6,9 +6,10 @@ import CryptoKit
 
 struct Plan: Codable {
     let schema: String
+    let planKind: String?
     let runID: String
     let createdAt: String
-    let databaseVersion: Int
+    let databaseVersion: Int?
     let afterCompletionPolicy: String
     let unsupportedPolicy: String?
     let recurringProjectPolicy: String?
@@ -39,6 +40,8 @@ struct PlanItem: Codable {
     let priority: Int
     let recurrenceRules: [RecurrenceSpec]
     let recurrenceOriginalMode: String?
+    let completed: Bool?
+    let completionDate: String?
     let warnings: [String]
 }
 
@@ -55,6 +58,7 @@ struct RecurrenceSpec: Codable {
 
 struct Manifest: Codable {
     var schema: String = "things-reminders-manifest/v3"
+    var planKind: String? = nil
     var runID: String
     var planSHA256: String
     var status: String
@@ -268,6 +272,16 @@ func localStartOfDay(_ value: String) throws -> Date {
     return Calendar.current.startOfDay(for: date)
 }
 
+func parseArchiveTimestamp(_ value: String) throws -> Date {
+    let fractional = ISO8601DateFormatter()
+    fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = fractional.date(from: value) { return date }
+    let wholeSeconds = ISO8601DateFormatter()
+    wholeSeconds.formatOptions = [.withInternetDateTime]
+    if let date = wholeSeconds.date(from: value) { return date }
+    throw BridgeError.invalid("Invalid archive completion timestamp: \(value)")
+}
+
 func parseLocalDateTime(_ value: String) throws -> Date {
     // Planner emits YYYY-MM-DDTHH:mm with intentionally local semantics.
     let formatter = DateFormatter()
@@ -442,6 +456,20 @@ func validationIssues(item: PlanItem, reminder: EKReminder) -> [String] {
     let notes = reminder.notes ?? ""
     if notes != item.notes { issues.append("notes mismatch") }
     if reminder.priority != item.priority { issues.append("priority mismatch") }
+    if let expectedCompleted = item.completed {
+        if reminder.isCompleted != expectedCompleted { issues.append("completed-state mismatch") }
+        if let value = item.completionDate, let expectedDate = try? parseArchiveTimestamp(value) {
+            if let actualDate = reminder.completionDate {
+                if abs(actualDate.timeIntervalSince(expectedDate)) >= 1 { issues.append("completion date mismatch") }
+            } else {
+                issues.append("completion date missing")
+            }
+        } else if item.completionDate != nil {
+            issues.append("invalid expected completion date")
+        } else if expectedCompleted && reminder.completionDate == nil {
+            issues.append("completion date missing")
+        }
+    }
     if dateOnlyString(reminder.dueDateComponents) != item.dueDate { issues.append("due date mismatch") }
     let expectedURL = item.url.flatMap { URL(string: $0)?.absoluteString }
     if reminder.url?.absoluteString != expectedURL { issues.append("URL mismatch") }
@@ -488,6 +516,64 @@ func validationIssues(item: PlanItem, reminder: EKReminder) -> [String] {
     return Array(Set(issues)).sorted()
 }
 
+func validatePlanItems(_ plan: Plan) throws {
+    guard Set(plan.calendarTitles).count == plan.calendarTitles.count else {
+        throw BridgeError.invalid("Plan contains duplicate destination lists")
+    }
+    let calendarTitles = Set(plan.calendarTitles)
+    var sourceIDs = Set<String>()
+    for item in plan.items {
+        guard !item.sourceID.isEmpty && sourceIDs.insert(item.sourceID).inserted else {
+            throw BridgeError.invalid("Plan contains an empty or duplicate source ID: \(item.sourceID)")
+        }
+        guard !item.title.isEmpty else { throw BridgeError.invalid("Plan item has an empty Reminders title: \(item.sourceID)") }
+        guard calendarTitles.contains(item.listTitle) else {
+            throw BridgeError.invalid("Plan item references an undeclared destination list: \(item.listTitle)")
+        }
+        guard (0...9).contains(item.priority) else { throw BridgeError.invalid("Invalid priority: \(item.title)") }
+        if item.recurrenceRules.contains(where: { !($0.setPositions ?? []).isEmpty }) {
+            throw BridgeError.invalid(
+                "Plan contains a BYSETPOS recurrence rule that Apple Reminders may ignore: \(item.title). " +
+                "Regenerate the plan with migrator v0.3.7 or newer."
+            )
+        }
+        if item.dueDate == nil && !item.recurrenceRules.isEmpty {
+            throw BridgeError.invalid("Recurring item lacks first due date: \(item.title)")
+        }
+        if let value = item.dueDate { _ = try dueComponents(value) }
+        if item.alarmDate != nil && item.dueDate == nil {
+            throw BridgeError.invalid("Alarm requires a due date: \(item.title)")
+        }
+        if let alarm = item.alarmDate { _ = try parseLocalDateTime(alarm) }
+        if let value = item.url, URL(string: value) == nil { throw BridgeError.invalid("Invalid URL: \(item.title)") }
+        if item.completionDate != nil && item.completed != true {
+            throw BridgeError.invalid("Completion date requires completed=true: \(item.title)")
+        }
+        if item.completed == true && item.completionDate == nil {
+            throw BridgeError.invalid("Completed archive item lacks completion date: \(item.title)")
+        }
+        if item.completed == true && (item.alarmDate != nil || !item.recurrenceRules.isEmpty) {
+            throw BridgeError.invalid("Completed archive item must not have an alarm or recurrence: \(item.title)")
+        }
+        if let value = item.completionDate { _ = try parseArchiveTimestamp(value) }
+        for rule in item.recurrenceRules { _ = try recurrenceRule(from: rule) }
+    }
+}
+
+func validatePlanDefinition(_ plan: Plan) throws {
+    guard ["things-reminders-plan/v1", "things-reminders-plan/v2", "things-reminders-plan/v3", "things-reminders-plan/v4", "things-reminders-plan/v5"].contains(plan.schema) else {
+        throw BridgeError.invalid("Unknown plan schema: \(plan.schema)")
+    }
+    guard plan.planKind == nil || ["main_migration", "verbatim_archive"].contains(plan.planKind!) else {
+        throw BridgeError.invalid("Unknown plan kind: \(plan.planKind!)")
+    }
+    guard !plan.blocked else { throw BridgeError.invalid("Plan is blocked; resolve unsupported items before apply") }
+    if !plan.unsupported.isEmpty && plan.unsupportedPolicy != "manual" {
+        throw BridgeError.invalid("Plan contains unsupported items without manual-exclusion policy")
+    }
+    try validatePlanItems(plan)
+}
+
 func writeState(runURL: URL, runID: String, status: String) throws {
     let state = StateFile(schema: "things-reminders-state/v1", runID: runID, status: status, updatedAt: utcNow())
     try atomicWrite(state, to: runURL.appendingPathComponent("state.json"))
@@ -498,23 +584,7 @@ func apply(runURL: URL) throws {
     let manifestURL = runURL.appendingPathComponent("manifest.json")
     let planHash = try fileSHA256(planURL)
     let plan = try readJSON(Plan.self, from: planURL)
-    guard ["things-reminders-plan/v1", "things-reminders-plan/v2", "things-reminders-plan/v3", "things-reminders-plan/v4"].contains(plan.schema) else {
-        throw BridgeError.invalid("Unknown plan schema: \(plan.schema)")
-    }
-    guard !plan.blocked else { throw BridgeError.invalid("Plan is blocked; resolve unsupported items before apply") }
-    if !plan.unsupported.isEmpty && plan.unsupportedPolicy != "manual" {
-        throw BridgeError.invalid("Plan contains unsupported items without manual-exclusion policy")
-    }
-    let setPositionItems = plan.items.filter { item in
-        item.recurrenceRules.contains { !($0.setPositions ?? []).isEmpty }
-    }
-    if !setPositionItems.isEmpty {
-        let titles = setPositionItems.prefix(5).map { $0.title }.joined(separator: ", ")
-        throw BridgeError.invalid(
-            "Plan contains BYSETPOS recurrence rules that Apple Reminders may ignore for reminders (for example: \(titles)). " +
-            "Regenerate the plan with migrator v0.3.7 or newer."
-        )
-    }
+    try validatePlanDefinition(plan)
 
     var manifest: Manifest
     if FileManager.default.fileExists(atPath: manifestURL.path) {
@@ -524,6 +594,11 @@ func apply(runURL: URL) throws {
         }
         guard manifest.runID == plan.runID else { throw BridgeError.invalid("Manifest/plan run ID mismatch") }
         guard manifest.planSHA256 == planHash else { throw BridgeError.invalid("plan.json changed after the manifest was created; refusing to resume") }
+        let expectedKind = plan.planKind ?? "main_migration"
+        if let storedKind = manifest.planKind, storedKind != expectedKind {
+            throw BridgeError.invalid("Manifest/plan kind mismatch")
+        }
+        manifest.planKind = expectedKind
         _ = try reminderRecordsBySource(manifest)
         if manifest.status.hasPrefix("rollback") || manifest.status == "rolled_back" {
             throw BridgeError.invalid("This run entered rollback state. Create a new plan to apply again safely.")
@@ -537,6 +612,7 @@ func apply(runURL: URL) throws {
             updatedAt: utcNow(),
             calendars: [], reminders: [], errors: [], rollback: nil
         )
+        manifest.planKind = plan.planKind ?? "main_migration"
         try persistManifest(manifest, to: manifestURL)
     }
 
@@ -612,6 +688,10 @@ func apply(runURL: URL) throws {
                 reminder.addAlarm(EKAlarm(relativeOffset: offset))
             }
             for rule in item.recurrenceRules { reminder.addRecurrenceRule(try recurrenceRule(from: rule)) }
+            if let completed = item.completed {
+                reminder.isCompleted = completed
+                if let value = item.completionDate { reminder.completionDate = try parseArchiveTimestamp(value) }
+            }
 
             do { try store.save(reminder, commit: true) }
             catch { throw BridgeError.eventKit("Cannot create reminder '\(item.title)': \(error)") }
@@ -674,6 +754,9 @@ func verify(runURL: URL) throws {
         throw BridgeError.invalid("Unknown manifest schema: \(manifest.schema)")
     }
     guard plan.runID == manifest.runID else { throw BridgeError.invalid("Manifest/plan run ID mismatch") }
+    guard (manifest.planKind ?? "main_migration") == (plan.planKind ?? "main_migration") else {
+        throw BridgeError.invalid("Manifest/plan kind mismatch")
+    }
     guard manifest.planSHA256 == (try fileSHA256(planURL)) else { throw BridgeError.invalid("plan.json changed after apply") }
     let store = EKEventStore()
     try requestReminderAccess(store)
@@ -858,40 +941,26 @@ func rollback(runURL: URL) throws {
     print("Rollback complete.")
 }
 
+func validateOnly(runURL: URL) throws {
+    let plan = try readJSON(Plan.self, from: runURL.appendingPathComponent("plan.json"))
+    try validatePlanDefinition(plan)
+    let completedCount = plan.items.filter { $0.completed == true }.count
+    print("Plan valid: \(plan.items.count) reminders, \(plan.calendarTitles.count) destination list(s), \(completedCount) completed archive items. Reminders was not accessed.")
+}
+
 func preflight(runURL: URL) throws {
     let plan = try readJSON(Plan.self, from: runURL.appendingPathComponent("plan.json"))
-    guard ["things-reminders-plan/v1", "things-reminders-plan/v2", "things-reminders-plan/v3", "things-reminders-plan/v4"].contains(plan.schema) else {
-        throw BridgeError.invalid("Unknown plan schema: \(plan.schema)")
-    }
-    guard !plan.blocked else { throw BridgeError.invalid("Plan is blocked") }
-    if !plan.unsupported.isEmpty && plan.unsupportedPolicy != "manual" {
-        throw BridgeError.invalid("Plan contains unsupported items without manual-exclusion policy")
-    }
-    let setPositionItems = plan.items.filter { item in
-        item.recurrenceRules.contains { !($0.setPositions ?? []).isEmpty }
-    }
-    if !setPositionItems.isEmpty {
-        let titles = setPositionItems.prefix(5).map { $0.title }.joined(separator: ", ")
-        throw BridgeError.invalid(
-            "Plan contains BYSETPOS recurrence rules that Apple Reminders may ignore for reminders (for example: \(titles)). " +
-            "Regenerate the plan with migrator v0.3.7 or newer."
-        )
-    }
+    try validatePlanDefinition(plan)
     let store = EKEventStore()
     try requestReminderAccess(store)
     let destinationSource = try chooseWritableSource(store)
     print("Destination Reminders account: \(destinationSource.title) [\(destinationSource.sourceIdentifier)]")
-    for item in plan.items {
-        if item.dueDate == nil && !item.recurrenceRules.isEmpty {
-            throw BridgeError.invalid("Recurring item lacks first due date: \(item.title)")
-        }
-        for rule in item.recurrenceRules { _ = try recurrenceRule(from: rule) }
-    }
-    print("Preflight OK: \(plan.items.count) reminders, \(plan.calendarTitles.count) lists, \(plan.items.filter { !$0.recurrenceRules.isEmpty }.count) recurring.")
+    let completedCount = plan.items.filter { $0.completed == true }.count
+    print("Preflight OK: \(plan.items.count) reminders, \(plan.calendarTitles.count) lists, \(plan.items.filter { !$0.recurrenceRules.isEmpty }.count) recurring, \(completedCount) completed archive items.")
 }
 
 func usage() -> Never {
-    fputs("Usage: EventKitBridge preflight|apply|verify|rollback-preview|rollback <run-directory>\n", stderr)
+    fputs("Usage: EventKitBridge validate-plan|preflight|apply|verify|rollback-preview|rollback <run-directory>\n", stderr)
     exit(64)
 }
 
@@ -902,6 +971,7 @@ func main() throws {
     let runURL = URL(fileURLWithPath: NSString(string: args[2]).expandingTildeInPath, isDirectory: true)
     guard FileManager.default.fileExists(atPath: runURL.path) else { throw BridgeError.invalid("Run directory not found: \(runURL.path)") }
     switch command {
+    case "validate-plan": try validateOnly(runURL: runURL)
     case "preflight": try preflight(runURL: runURL)
     case "apply": try apply(runURL: runURL)
     case "verify": try verify(runURL: runURL)

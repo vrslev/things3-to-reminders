@@ -152,7 +152,11 @@ class PlannerTests(unittest.TestCase):
         try:
             plan, report, blocked = planner.build_plan(path, 'run1', 'Things Import run1', 'abort', False)
             self.assertFalse(blocked, report)
+            self.assertEqual('things-reminders-plan/v5', plan['schema'])
+            self.assertEqual('main_migration', plan['planKind'])
             self.assertEqual(2, len(plan['items']))
+            self.assertTrue(all(item['completed'] is None for item in plan['items']))
+            self.assertTrue(all(item['completionDate'] is None for item in plan['items']))
             recurring = next(x for x in plan['items'] if x['sourceID'] == 'template')
             self.assertEqual('instance', recurring['sourceInstanceID'])
             self.assertEqual('2026-07-22', recurring['dueDate'])

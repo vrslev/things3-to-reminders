@@ -1,6 +1,6 @@
 # Things 3 → Apple Reminders — safe, reversible migrato (100% ChatGPT authored)
 
-A local macOS migration tool with native recurring-reminder support.
+A local macOS migration tool with native recurring-reminder support and a reversible completed-reminder view of a verbatim Things knowledge archive.
 
 It reads a consistent **read-only snapshot** of Things' SQLite database and writes through Apple's public **EventKit** framework. It does not modify Things and does not access the network. Things does not provide an official full-export API, so the reader is necessarily reverse-engineered; schema/version guards make it fail closed rather than continue after an unknown Things change.
 
@@ -72,6 +72,70 @@ Version 0.3.7 uses the direct representation for fixed month days:
 No `setPositions` value is emitted for these rules. Preflight and apply also reject older plans containing `setPositions`, so an unsafe v0.3.5/v0.3.6 plan cannot be applied accidentally with the new bridge.
 
 Things uses `dy = -1` for “last day of the month”. On the tested Reminders build, both the documented negative month-day and the `BYSETPOS` workaround are normalized incorrectly. Version 0.3.7 therefore excludes last-day rules into `MANUAL_REVIEW.md` instead of inventing an inaccurate schedule.
+
+## Build the verbatim knowledge index
+
+The archive producer is included as `src/archive.py` and exposed through `./things-reminders archive`. It has no dependency on another repository and makes no model calls.
+
+From an explicit read-only Things snapshot:
+
+```sh
+SNAPSHOT=~/Downloads/Things-Logbook-20260716-133933.sqlite
+ARCHIVE_RUN=~/Downloads/Things-Verbatim-Archive-$(date +%Y%m%d-%H%M%S)
+
+./things-reminders archive stage --db "$SNAPSHOT" --out "$ARCHIVE_RUN"
+./things-reminders archive review \
+  --archive "$ARCHIVE_RUN/archive.sqlite" \
+  --sample-out "$ARCHIVE_RUN/calibration.json" \
+  --out "$ARCHIVE_RUN/review.html" --count 60
+```
+
+Label `review.html`, download `things-verbatim-record-labels.json`, then run:
+
+```sh
+./things-reminders archive import-labels \
+  --archive "$ARCHIVE_RUN/archive.sqlite" \
+  --labels ~/Downloads/things-verbatim-record-labels.json
+
+./things-reminders archive build-index \
+  --archive "$ARCHIVE_RUN/archive.sqlite" \
+  --json "$ARCHIVE_RUN/knowledge-index.json" \
+  --html "$ARCHIVE_RUN/knowledge-index.html"
+```
+
+`archive.sqlite` retains every exact source row and provides FTS5 search. `knowledge-index.json` is the machine-readable high-recall candidate index; `knowledge-index.html` is its private offline browser. Labels are bound to the source snapshot SHA-256 and cannot be silently applied to another snapshot.
+
+## Verbatim archive → completed Reminders
+
+`archive-plan` accepts the generated `things-verbatim-knowledge-index/v1` JSON file and creates a standard, reviewable run directory. Planning is local-only and does not access Reminders.
+
+Create a 100-record pilot that includes human-approved records, edge cases, and a deterministic sample:
+
+```sh
+./things-reminders archive-plan \
+  --index ~/Downloads/Things-Verbatim-Archive-20260716/knowledge-index.json \
+  --count 100
+```
+
+Review `report.txt`, `plan.csv`, and `plan.json`, then use the shared lifecycle:
+
+```sh
+./things-reminders run-kind "/path/to/archive-run"       # verbatim_archive
+./things-reminders validate-plan "/path/to/archive-run"  # no Reminders access
+./things-reminders preflight "/path/to/archive-run"
+./things-reminders apply "/path/to/archive-run"
+./things-reminders verify "/path/to/archive-run"
+./things-reminders rollback-preview "/path/to/archive-run"
+./things-reminders rollback "/path/to/archive-run"
+```
+
+Plans carry either `planKind: main_migration` or `planKind: verbatim_archive`. The shared lifecycle validates and persists that kind in `manifest.json`; a manifest/plan kind mismatch fails closed. Each run still has a separate directory, destination lists, manifest, EventKit IDs, logs, and rollback inventory.
+
+After accepting and rolling back the pilot, omit `--count` to plan the complete index in fresh isolated lists, one per Things Area (plus `No Area` for records without one). Duplicate Area names receive stable identity suffixes.
+
+Archive reminders have a native historical date but no alarm or recurrence. They are marked completed with the exact archive timestamp, use its local calendar date as the visible Reminders date, retain the exact non-empty title, and use the native URL field for the Things link. Visible notes use the same concise style as normal imports: exact original notes first, followed only by `Project`, `Heading`, tags, and a Markdown checklist when present. Archive categories, classification, source status, IDs, timestamps, and provenance remain private in the source index and plan. Canceled Things records are completed in Reminders solely to keep this read-only mirror hidden. Empty Things titles require a generated visible Reminders label, while the exact empty source title remains preserved in `sourceTitle` and the immutable source index.
+
+The planner copies the exact source index into the run directory, records both source hashes, and reuses manifest-ID verification and rollback. Treat Reminders as a regenerable interface; the immutable SQLite/JSON archive remains canonical. Do not use **Clear Completed** on the archive list unless you intend to regenerate it.
 
 ## Requirements
 
@@ -210,6 +274,10 @@ Open `MANUAL_ROLLBACK.txt` in the run directory. In brief:
 ./things-reminders doctor
 ./things-reminders inspect [--db PATH]
 ./things-reminders plan [--unsupported=abort|manual] [--after-completion=abort|fixed] [--recurring-projects=summary|manual]
+./things-reminders archive stage|profile|review|import-labels|label-report|build-index [options]
+./things-reminders archive-plan --index PATH [--count N] [--run-dir PATH] [--run-id ID] [--list-prefix TEXT]
+./things-reminders run-kind RUN_DIR
+./things-reminders validate-plan RUN_DIR
 ./things-reminders preflight RUN_DIR
 ./things-reminders apply RUN_DIR
 ./things-reminders verify RUN_DIR
@@ -223,7 +291,7 @@ Open `MANUAL_ROLLBACK.txt` in the run directory. In brief:
 ./run-tests.sh
 ```
 
-The 29 planner tests cover recurring-instance deduplication, recurring-project summary/manual modes, nested recurring-task suppression, inactive parent project/heading filtering, weekly/monthly/yearly decoding, exact first/21st monthly-day mapping, fail-closed last-day handling, recurring deadline offsets, missing instances, paused templates, undocumented recurrence fields, duplicate Area names, URL extraction, concise Markdown notes, strict After Completion handling, explicit fixed conversion, manual exclusion, snapshot isolation, and schema guards. Swift syntax is also parsed during the test run. EventKit writes themselves must be exercised on macOS because this environment cannot access your Reminders store.
+The 38 Python tests cover verbatim archive staging/indexing, archive-index validation, deterministic pilot selection, completed archive plans, empty-title adaptation, recurring-instance deduplication, recurring-project summary/manual modes, nested recurring-task suppression, inactive parent project/heading filtering, weekly/monthly/yearly decoding, exact first/21st monthly-day mapping, fail-closed last-day handling, recurring deadline offsets, missing instances, paused templates, undocumented recurrence fields, duplicate Area names, URL extraction, strict After Completion handling, snapshot isolation, and schema guards. A shell regression test proves run-kind dispatch, legacy-plan fallback, and manifest authority. Swift syntax is also parsed during the test run. EventKit writes themselves must be exercised on macOS because automated tests do not modify your Reminders store.
 
 ## Why recurring projects are represented as summaries
 

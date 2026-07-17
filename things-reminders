@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="${0:A:h}"
 PLANNER="$ROOT/src/planner.py"
+ARCHIVE="$ROOT/src/archive.py"
+ARCHIVE_PLANNER="$ROOT/src/archive_planner.py"
 BRIDGE="$ROOT/.build/EventKitBridge"
 BRIDGE_SRC="$ROOT/src/EventKitBridge.swift"
 PLIST_SRC="$ROOT/src/Info.plist"
@@ -13,6 +15,10 @@ Usage:
   ./things-reminders doctor
   ./things-reminders inspect [planner options]
   ./things-reminders plan [planner options]
+  ./things-reminders archive stage|profile|review|import-labels|label-report|build-index [options]
+  ./things-reminders archive-plan --index PATH [--count N] [archive options]
+  ./things-reminders run-kind RUN_DIR
+  ./things-reminders validate-plan RUN_DIR
   ./things-reminders preflight RUN_DIR
   ./things-reminders apply RUN_DIR [--yes]
   ./things-reminders verify RUN_DIR
@@ -25,6 +31,8 @@ Safe defaults:
   Add --recurring-projects=manual to leave recurring projects for hand transfer instead.
   Add --unsupported=manual to import everything supported and create MANUAL_REVIEW.md.
   Add --after-completion=fixed only to intentionally convert those rules to fixed schedules.
+  archive stage reads only an explicit snapshot; archive review/index commands write only local artifacts.
+  archive-plan creates completed reminders in isolated lists by Things Area and never writes during planning.
 EOF
 }
 
@@ -57,13 +65,30 @@ with open(sys.argv[1], encoding='utf-8') as f:
 PY
 }
 
+run_kind_for() {
+  /usr/bin/env python3 - "$1" <<'PY'
+import json, pathlib, sys
+run = pathlib.Path(sys.argv[1])
+for name in ("manifest.json", "plan.json"):
+    path = run / name
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            value = json.load(f).get("planKind")
+        print(value or "main_migration")
+        break
+else:
+    raise SystemExit("Neither plan.json nor manifest.json exists")
+PY
+}
+
 confirm_apply() {
   local run="$1" yes="${2:-}"
   [[ "$yes" == "--yes" ]] && return 0
-  local id count answer
+  local id count kind answer
   id="$(run_id_for "$run")"
   count="$(planned_count_for "$run")"
-  print "This will CREATE $count reminders in isolated lists prefixed with run ID $id."
+  kind="$(run_kind_for "$run")"
+  print "This will CREATE $count reminders for plan kind '$kind' in isolated lists prefixed with run ID $id."
   print -n "Type the exact run ID to continue: "
   read -r answer
   [[ "$answer" == "$id" ]] || { print -u2 "Confirmation did not match; nothing changed."; exit 1; }
@@ -72,12 +97,41 @@ confirm_apply() {
 confirm_rollback() {
   local run="$1" yes="${2:-}"
   [[ "$yes" == "--yes" ]] && return 0
-  local id answer
+  local id kind answer
   id="$(run_id_for "$run")"
-  print "Rollback deletes exact EventKit reminder IDs recorded in manifest.json; empty migration-created lists are then removed."
+  kind="$(run_kind_for "$run")"
+  print "Rollback for plan kind '$kind' deletes exact EventKit reminder IDs recorded in manifest.json; empty migration-created lists are then removed."
   print -n "Type ROLLBACK $id to continue: "
   read -r answer
   [[ "$answer" == "ROLLBACK $id" ]] || { print -u2 "Confirmation did not match; nothing changed."; exit 1; }
+}
+
+apply_run() {
+  local run="$1" yes="${2:-}"
+  [[ -f "$run/plan.json" ]] || { print -u2 "Missing plan.json in $run"; exit 1; }
+  need_bridge
+  mkdir -p "$run/logs"
+  "$BRIDGE" preflight "$run" 2>&1 | tee -a "$run/logs/preflight.log"
+  confirm_apply "$run" "$yes"
+  "$BRIDGE" apply "$run" 2>&1 | tee -a "$run/logs/apply.log"
+  "$BRIDGE" verify "$run" 2>&1 | tee -a "$run/logs/verify.log"
+}
+
+rollback_preview_run() {
+  local run="$1"
+  [[ -f "$run/manifest.json" ]] || { print -u2 "Missing manifest.json in $run; nothing can be previewed safely."; exit 1; }
+  need_bridge
+  "$BRIDGE" rollback-preview "$run"
+}
+
+rollback_run() {
+  local run="$1" yes="${2:-}"
+  [[ -f "$run/manifest.json" ]] || { print -u2 "Missing manifest.json in $run; nothing can be rolled back safely."; exit 1; }
+  need_bridge
+  mkdir -p "$run/logs"
+  "$BRIDGE" rollback-preview "$run" 2>&1 | tee -a "$run/logs/rollback-preview.log"
+  confirm_rollback "$run" "$yes"
+  "$BRIDGE" rollback "$run" 2>&1 | tee -a "$run/logs/rollback.log"
 }
 
 [[ $# -ge 1 ]] || { usage; exit 64; }
@@ -100,6 +154,21 @@ case "$command" in
   plan)
     exec /usr/bin/env python3 "$PLANNER" plan "$@"
     ;;
+  archive)
+    exec /usr/bin/env python3 "$ARCHIVE" "$@"
+    ;;
+  archive-plan)
+    exec /usr/bin/env python3 "$ARCHIVE_PLANNER" "$@"
+    ;;
+  run-kind)
+    [[ $# -eq 1 ]] || { usage; exit 64; }
+    run_kind_for "${1:A}"
+    ;;
+  validate-plan)
+    [[ $# -eq 1 ]] || { usage; exit 64; }
+    need_bridge
+    exec "$BRIDGE" validate-plan "${1:A}"
+    ;;
   preflight)
     [[ $# -eq 1 ]] || { usage; exit 64; }
     need_bridge
@@ -107,14 +176,7 @@ case "$command" in
     ;;
   apply)
     [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
-    run="${1:A}"; yes="${2:-}"
-    [[ -f "$run/plan.json" ]] || { print -u2 "Missing plan.json in $run"; exit 1; }
-    need_bridge
-    mkdir -p "$run/logs"
-    "$BRIDGE" preflight "$run" 2>&1 | tee -a "$run/logs/preflight.log"
-    confirm_apply "$run" "$yes"
-    "$BRIDGE" apply "$run" 2>&1 | tee -a "$run/logs/apply.log"
-    "$BRIDGE" verify "$run" 2>&1 | tee -a "$run/logs/verify.log"
+    apply_run "${1:A}" "${2:-}"
     ;;
   verify)
     [[ $# -eq 1 ]] || { usage; exit 64; }
@@ -123,20 +185,11 @@ case "$command" in
     ;;
   rollback-preview)
     [[ $# -eq 1 ]] || { usage; exit 64; }
-    run="${1:A}"
-    [[ -f "$run/manifest.json" ]] || { print -u2 "Missing manifest.json in $run; nothing can be previewed safely."; exit 1; }
-    need_bridge
-    exec "$BRIDGE" rollback-preview "$run"
+    rollback_preview_run "${1:A}"
     ;;
   rollback)
     [[ $# -ge 1 && $# -le 2 ]] || { usage; exit 64; }
-    run="${1:A}"; yes="${2:-}"
-    [[ -f "$run/manifest.json" ]] || { print -u2 "Missing manifest.json in $run; nothing can be rolled back safely."; exit 1; }
-    need_bridge
-    mkdir -p "$run/logs"
-    "$BRIDGE" rollback-preview "$run" 2>&1 | tee -a "$run/logs/rollback-preview.log"
-    confirm_rollback "$run" "$yes"
-    "$BRIDGE" rollback "$run" 2>&1 | tee -a "$run/logs/rollback.log"
+    rollback_run "${1:A}" "${2:-}"
     ;;
   *) usage; exit 64 ;;
 esac

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
-SCHEMA = "things-reminders-plan/v4"
+SCHEMA = "things-reminders-plan/v5"
 SUPPORTED_DB_VERSIONS = {24, 25, 26}
 RECURRING_DEADLINE_PLACEHOLDER = 262_213_760
 NEXT_INSTANCE_PLACEHOLDER = 69_760
@@ -927,6 +927,8 @@ def build_plan(
             "priority": 0,
             "recurrenceRules": recurrence.rules if recurrence else [],
             "recurrenceOriginalMode": recurrence.original_mode if recurrence else None,
+            "completed": None,
+            "completionDate": None,
             "warnings": item_warnings,
         }
         items.append(item)
@@ -1037,6 +1039,7 @@ def build_plan(
     blocked = bool(unsupported) and unsupported_policy == "abort"
     plan = {
         "schema": SCHEMA,
+        "planKind": "main_migration",
         "runID": run_id,
         "createdAt": now_utc(),
         "databaseVersion": version,
@@ -1092,11 +1095,12 @@ def write_review_files(run_dir: Path, plan: dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["source_id", "title", "list", "due_date", "alarm_date", "recurring", "original_mode", "warnings"])
+            writer.writerow(["source_id", "title", "list", "due_date", "alarm_date", "completed", "completion_date", "recurring", "original_mode", "warnings"])
             for item in plan["items"]:
                 writer.writerow([
                     item["sourceID"], item["title"], item["listTitle"], item["dueDate"] or "",
-                    item["alarmDate"] or "", "yes" if item["recurrenceRules"] else "no",
+                    item["alarmDate"] or "", "yes" if item.get("completed") else "no",
+                    item.get("completionDate") or "", "yes" if item["recurrenceRules"] else "no",
                     item["recurrenceOriginalMode"] or "", " | ".join(item["warnings"]),
                 ])
             f.flush(); os.fsync(f.fileno())
